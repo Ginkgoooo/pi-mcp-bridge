@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { Type } from "typebox";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -73,12 +73,29 @@ export default async function mcpBridge(pi: ExtensionAPI) {
 	pi.registerCommand("mcp", {
 		description: "List connected MCP servers and tools",
 		getArgumentCompletions: (prefix) => {
-			const values = ["tools", "logs"];
+			const values = ["enable", "disable", "tools", "logs"];
 			const filtered = values.filter((value) => value.startsWith(prefix.trim()));
 			return filtered.length ? filtered.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
 			const [subcommand, serverKey] = args.trim().split(/\s+/, 2);
+			if (subcommand === "enable" || subcommand === "disable") {
+				if (!serverKey) {
+					ctx.ui.notify(`Usage: /mcp ${subcommand} <serverKey>`, "warning");
+					return;
+				}
+
+				try {
+					setProjectServerEnabled(ctx.cwd, serverKey, subcommand === "enable");
+					ctx.ui.notify(`MCP server '${serverKey}' ${subcommand === "enable" ? "enabled" : "disabled"} in .pi/settings.json. Reloading...`, "info");
+					await ctx.reload();
+					return;
+				} catch (error) {
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+					return;
+				}
+			}
+
 			if (subcommand === "tools") {
 				const lines = activeConnections
 					.filter((connection) => !serverKey || connection.key === serverKey)
@@ -298,6 +315,51 @@ function readMcpServers(cwd: string): McpServers {
 	const globalSettings = readJsonObject(globalSettingsPath);
 	const projectSettings = readJsonObject(projectSettingsPath);
 	return mergeMcpServers(globalSettings.mcpServers, projectSettings.mcpServers);
+}
+
+function setProjectServerEnabled(cwd: string, key: string, enabled: boolean): void {
+	validateServerKey(key);
+	const projectPiDir = join(cwd, ".pi");
+	const projectSettingsPath = join(projectPiDir, "settings.json");
+	const projectSettings = readJsonObject(projectSettingsPath);
+	const mergedServers = readMcpServers(cwd);
+	const existingProjectServers = isPlainObject(projectSettings.mcpServers)
+		? (projectSettings.mcpServers as Record<string, unknown>)
+		: {};
+	const existingProjectServer = isPlainObject(existingProjectServers[key])
+		? (existingProjectServers[key] as Record<string, unknown>)
+		: {};
+
+	let nextServer: Record<string, unknown> = { ...existingProjectServer, enabled };
+	if (enabled && !mergedServers[key]?.command && !nextServer.command) {
+		const defaults = getKnownServerDefaults(key);
+		if (!defaults) {
+			throw new Error(
+				`MCP server '${key}' has no command configured. Add it to settings.mcpServers.${key}, or use one of: pw, cdp.`,
+			);
+		}
+		// Store full known defaults in the project config so /mcp enable works even
+		// when global settings do not predeclare the server.
+		nextServer = { ...defaults, ...nextServer };
+	}
+
+	projectSettings.mcpServers = {
+		...existingProjectServers,
+		[key]: nextServer,
+	};
+
+	mkdirSync(projectPiDir, { recursive: true });
+	writeFileSync(projectSettingsPath, `${JSON.stringify(projectSettings, null, 2)}\n`, "utf8");
+}
+
+function getKnownServerDefaults(key: string): McpServerConfig | undefined {
+	if (key === "pw") {
+		return { command: "npx", args: ["-y", "@playwright/mcp@latest"], enabled: false };
+	}
+	if (key === "cdp") {
+		return { command: "npx", args: ["-y", "chrome-devtools-mcp@latest"], enabled: false };
+	}
+	return undefined;
 }
 
 function mergeMcpServers(globalValue: unknown, projectValue: unknown): McpServers {
